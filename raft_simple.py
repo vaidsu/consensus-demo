@@ -28,20 +28,27 @@ class LogStore:
         self.logs: List[LogEntry] = []
 
     def last_index(self):
-        pass 
+        return self.logs[-1].index if self.logs else 0
 
     def last_term(self):
-        pass 
+        return self.logs[-1].term if self.logs else 0
 
-    def term_at(self):
-        pass 
-
-    def append_entries(self):
-        pass 
+    def term_at(self, index: int) -> Optional[int]:
+        if index == 0: return 0 # Sentinel 
+        if 1 <= index <= self.last_index():
+            return self.logs[index-1].term
+        return None
     
-    def truncate_from(self):
-        pass 
+    def has_index(self, index: int) -> bool:
+        if index == 0: return True
+        return 1 <= index <= self.last_index()
 
+    def append_entry(self, entry: LogEntry) -> None:
+        # It is an append only entry, it doesn't care about the exact requirement. 
+        self.logs.append(entry)
+    
+    def truncate_from(self, index: int):
+        self.logs = self.logs[:index - 1]
 
 
 class NodeRole(Enum):
@@ -80,17 +87,18 @@ class VoteResponse:
     granted: bool
 
 @dataclass
-class AppendEntriesRequest: 
+class AppendEntryRequest: 
 
     term: int 
     leader_id: int 
     prev_index: int 
     prev_term: int 
-    entries: List[LogEntry]
+     # This is intentionally to simplify one entry at a time, where in reality there can be batching, streaming etc. 
+    entry: LogEntry
     leader_commit: int
 
 @dataclass
-class AppendEntriesResponse:
+class AppendEntryResponse:
 
     term: int 
     success: bool 
@@ -120,24 +128,186 @@ class Node:
         )
         self.all_node_ids = all_node_ids
 
+    def reconcile_term(self, term: int) -> bool:
+
+        if term < self.state.current_term:
+            return False 
+        if term > self.state.current_term:
+            self.state.current_term = term
+            self.state.role = NodeRole.FOLLOWER
+            self.state.voted_for = None
+        elif self.state.role == NodeRole.CANDIDATE and term == self.state.current_term:
+            # This needs to step down 
+            self.state.role = NodeRole.FOLLOWER
+        return True
+
+
+    def clean_append_entry(self, request: AppendEntryRequest) -> AppendEntryResponse:
+        self.state.log_store.append_entry(request.entry)
+        return AppendEntryResponse(term=request.term, success=True, match_index=self.state.log_store.last_index())
+        
+    def is_log_up_to_date(self, requested_last_term: int, requested_last_index: int) -> bool:
+        # candidate_last_term > my_last_term, OR
+        # candidate_last_term == my_last_term AND candidate_last_index >= my_last_index
+        
+        last_log_term = self.state.log_store.last_term()
+        last_log_index = self.state.log_store.last_index()
+        return requested_last_term > last_log_term or (
+            requested_last_term == last_log_term and 
+            requested_last_index >= last_log_index)
+
+
     def on_vote_request(self, request: VoteRequest) -> VoteResponse:
-        pass
+        """
+        Steps: 
 
-    def on_append_entries(self, request: AppendEntriesRequest) -> AppendEntriesResponse:
-        pass
+        1. Check the request's term with my term 
+        2. If request.term > my term, become FOLLOWER, update term and clear voted_for 
+        3. Update vote 
+        """
+
+        # Deny list first 
+        # Term check
+        if not self.reconcile_term(request.term):
+            return VoteResponse(term=request.term, granted=False)
+        
+        # Stale log check 
+        if not self.is_log_up_to_date(requested_last_term=request.last_log_term, requested_last_index=request.last_log_index):
+            return VoteResponse(term=self.state.current_term, granted=False)
+        # Grant one vote rule 
+        if self.state.voted_for is not None and self.state.voted_for != request.candidate_id:
+            return VoteResponse(term=self.state.current_term, granted=False)
+        
+        # Allow list
+        self.state.voted_for = request.candidate_id
+        return VoteResponse(term=self.state.current_term, granted=True)
+            
+
+    # TODO: Commit to be added 
+    def on_append_entry(self, request: AppendEntryRequest) -> AppendEntryResponse:
+        """
+        Scenarios:
+
+        1. Happy path :
+
+        # (index, term, cmd)
+        Leader [(1, 1, X), (2, 1, Y), (3, 1, Z)]
+        Follower [(1, 1, X), (2, 1, Y)]
+        When leader sends follower (3, 1, Z) -> Last_index 2, last_term 1
+        Follower accepts 
+
+        2. Conflict with data already available in follower 
+        Leader [(1, 1, X), (2, 1, Y), (3, 1, Z)]
+        Follower [(1, 1, X), (2, 1, Y), (3, 2, L)]
+        When leader sends follower (3, 1, Z) -> Last_index 2, last_term 1
+        Follower accepts the last_index and last_term, but finds that there is a conflict on index 3 with a new term, 
+        If conflict:
+          truncate_at(index=3) 
+          append(index=3)
+
+        3. Conflict in follower but rejects 
+        Leader [(1, 1, X), (2, 1, Y), (3, 1, Z)]
+        Follower [(1, 1, X)]
+        Leader sends follower (3, 1, Z) -> (2, 1)
+        Follower doesn't have 2, 1 and reject
+        Leader now has to send one index below.
+        """
+        # We will keep the log store's interface simple as its only job is to append and manage the "list" of entries
+        # The heavy lifting can be done by RAFT handling in the node that way we don't leak specific role based handling to the store and keep it in the node 
+            
+        # Deny list first 
+        # Term reconcilliation 
+        if not self.reconcile_term(request.term):
+            return AppendEntryResponse(term=request.term, success=False, match_index=None)
+        
+        # Check the last_index and last_term first 
+        cur_node_log_term = self.state.log_store.term_at(request.prev_index)
+        if request.prev_index > self.state.log_store.last_index():
+            # Entries missing 
+            return AppendEntryResponse(term=request.term, success=False, match_index=None)
+        # index match, so we check if terms match 
+        elif request.prev_index > 0 and cur_node_log_term != request.prev_term:
+            # Stale term coming in 
+            return AppendEntryResponse(term=request.term, success=False, match_index=None)
+        
+        # Ready to append, need to merge conflict checks 
+        if self.state.log_store.has_index(request.entry.index):
+            # Idempotency check 
+            if self.state.log_store.term_at(request.entry.index) == request.entry.term:
+                return AppendEntryResponse(term=self.state.current_term, success=True, match_index=self.state.log_store.last_index())
+            else:
+                # This means a true conflict, need to truncate to pave way 
+                LOG.error(f"Conflict - Index already exists for node {self.id} index {request.entry.index} store {self.state.log_store.logs}")
+                # Since the new leader has been elected, it accepts the new entries and truncates old 
+                # Truncate first 
+                self.state.log_store.truncate_from(request.entry.index)
+                # Now append 
+                return self.clean_append_entry(request)
+            
+        # If we come here, there is nothing conflicting to stop appending of entry 
+        return self.clean_append_entry(request)
+
+        
+
+    def start_election(self):
+        # Vote for self and request to become leader
+        self.state.role = NodeRole.CANDIDATE
+        self.state.current_term += 1
+        self.state.voted_for = self.id 
+        return self.id
+
+    def become_leader(self):
+        self.state.role = NodeRole.LEADER
+        # Reset voted for, for next term.
+        self.state.voted_for = self.id
+        
 
 
-class SimpleRaft:
+class RaftClusterSim:
 
     def __init__(self) -> None:
         self.nodes: List[Node] = []
         self.leader: Node = None
+        # For simulator purposes only 
+        self.cur_leader_index = -1
 
-    def send_vote_request(self, from_id: int, to_id: int, request: VoteRequest) -> VoteResponse:
-        pass 
+    def add_node(self, node: Node):
+        self.nodes.append(node)
 
-    def send_append_entries(self, from_id: int, to_id: int, request: AppendEntriesRequest) -> AppendEntriesResponse:
-        pass 
+    def start_election(self):
+        # Pick the next node and start election
+        self.cur_leader_index += 1
+        # To ensure we do round robin simulation
+        self.cur_leader_index = min(self.cur_leader_index, len(self.nodes) - 1)
+        candidate_node = self.nodes[self.cur_leader_index]
+        # Start election in the node 
+        candidate_id = candidate_node.start_election()
+        # Now send the vote request to other 
+        for n in self.nodes:
+            vote_response = self.send_vote_request(
+                to_node=n,
+                request=VoteRequest(
+                    term=candidate_node.state.current_term,
+                    candidate_id=candidate_id,
+                    # TBA 
+                    last_log_index=candidate_node.state.last_log_index,
+                    last_log_term=candidate_node.state.last_log_term
+                )
+            )
+            total_votes = sum(map(lambda x: x.granted, vote_response))
+            if total_votes > len(self.all_node_ids) // 2:
+                # Make the candidate the leader 
+                candidate_node.become_leader()
+
+        
+
+    def send_vote_request(self, to_node: Node, request: VoteRequest) -> VoteResponse:
+        # Simulation
+        # Find the node by id 
+        return to_node.on_vote_request(request=request)
+
+    def send_append_entry(self, to_node: Node, request: AppendEntryRequest) -> AppendEntryResponse:
+        return to_node.on_append_entry(request)
 
     def update_state(self):
         pass 
