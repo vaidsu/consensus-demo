@@ -95,7 +95,7 @@ class AppendEntryRequest:
     prev_term: int 
      # This is intentionally to simplify one entry at a time, where in reality there can be batching, streaming etc. 
     entry: LogEntry
-    leader_commit: int
+    leader_commit_index: int
 
 @dataclass
 class AppendEntryResponse:
@@ -140,11 +140,6 @@ class Node:
             # This needs to step down 
             self.state.role = NodeRole.FOLLOWER
         return True
-
-
-    def clean_append_entry(self, request: AppendEntryRequest) -> AppendEntryResponse:
-        self.state.log_store.append_entry(request.entry)
-        return AppendEntryResponse(term=request.term, success=True, match_index=self.state.log_store.last_index())
         
     def is_log_up_to_date(self, requested_last_term: int, requested_last_index: int) -> bool:
         # candidate_last_term > my_last_term, OR
@@ -242,10 +237,12 @@ class Node:
                 # Truncate first 
                 self.state.log_store.truncate_from(request.entry.index)
                 # Now append 
-                return self.clean_append_entry(request)
+                self.state.log_store.append_entry(request.entry)
+                return AppendEntryResponse(term=request.term, success=True, match_index=self.state.log_store.last_index())
             
         # If we come here, there is nothing conflicting to stop appending of entry 
-        return self.clean_append_entry(request)
+        self.state.log_store.append_entry(request.entry)
+        return AppendEntryResponse(term=request.term, success=True, match_index=self.state.log_store.last_index())
 
         
 
@@ -260,7 +257,6 @@ class Node:
         self.state.role = NodeRole.LEADER
         # Reset voted for, for next term.
         self.state.voted_for = self.id
-        
 
 
 class RaftClusterSim:
@@ -270,6 +266,7 @@ class RaftClusterSim:
         self.leader: Node = None
         # For simulator purposes only 
         self.cur_leader_index = -1
+        self.majority = len(self.nodes // 2) + 1
 
     def add_node(self, node: Node):
         self.nodes.append(node)
@@ -283,6 +280,7 @@ class RaftClusterSim:
         # Start election in the node 
         candidate_id = candidate_node.start_election()
         # Now send the vote request to other 
+        total_votes = 1
         for n in self.nodes:
             vote_response = self.send_vote_request(
                 to_node=n,
@@ -294,10 +292,11 @@ class RaftClusterSim:
                     last_log_term=candidate_node.state.last_log_term
                 )
             )
-            total_votes = sum(map(lambda x: x.granted, vote_response))
-            if total_votes > len(self.all_node_ids) // 2:
-                # Make the candidate the leader 
-                candidate_node.become_leader()
+            total_votes += 1 if vote_response.granted else 0
+        
+        if total_votes >= self.majority:
+            # Make the candidate the leader 
+            candidate_node.become_leader()
 
         
 
@@ -308,6 +307,46 @@ class RaftClusterSim:
 
     def send_append_entry(self, to_node: Node, request: AppendEntryRequest) -> AppendEntryResponse:
         return to_node.on_append_entry(request)
+    
+    def propose(self, entry: LogEntry):
+        # Append to leader first 
+        # This avoids moving by 1 after append
+        prev_index = self.leader.state.log_store.last_index()
+        prev_term = self.leader.state.log_store.term_at(prev_index)
+        self.leader.state.log_store.append_entry(entry)
+        # Propose to other nodes 
+        total_ack = 1 # Leader counts 1
+        for n in self.nodes:
+            if n.id != self.leader.id:
+                ack = n.on_append_entry(
+                    request=AppendEntryRequest(
+                        term=self.leader.state.current_term,
+                        leader_id=self.leader.id,
+                        prev_index=prev_index,
+                        prev_term=prev_term,
+                        entry=entry,
+                        leader_commit_index=self.leader.state.commit_index
+                    )
+                )
+                total_ack += 1 if ack.success else 0
+        
+        if total_ack >= self.majority:
+            LOG.info(f"Leader {self.leader.id} committed index {entry.index}")
+            self.leader.state.commit_index = entry.index
+
+            # Broadcast the commit 
+            for n in self.nodes:
+                if n.id != self.leader.id:
+                    n.on_append_entry(
+                        AppendEntryRequest(
+                            term=self.leader.state.current_term,
+                            leader_id=self.leader.id,
+                            prev_index=prev_index,
+                            prev_term=prev_term,
+                            entry=entry,  # resend ok - Idempotent
+                            leader_commit_index=self.leader.state.commit_index
+                        )
+                    )
 
     def update_state(self):
         pass 
