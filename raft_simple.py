@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
 import logging
+from collections import defaultdict
 
 LOG = logging.getLogger('SimpleRaft')
 
@@ -49,6 +50,10 @@ class LogStore:
     
     def truncate_from(self, index: int):
         self.logs = self.logs[:index - 1]
+
+    def get(self, index: int) -> LogEntry:
+        if index == 0: return None
+        return self.logs[index - 1]
 
 
 class NodeRole(Enum):
@@ -105,10 +110,19 @@ class AppendEntryResponse:
     match_index: int
 
 
+
 class StateMachine: 
 
     def __init__(self):
-        pass
+        self.data: dict[str, int] = defaultdict(int) # {"sensor1": 32} # Like temperature 
+
+    def set_data(self, command):
+        # SET sensor1 31
+        # Dumb processing 
+        splits = [a.strip() for a in command.split(' ') if a]
+        sensor_name = splits[1]
+        value = int(splits[2])
+        self.data[sensor_name] = value
 
 
 class Node:
@@ -123,9 +137,9 @@ class Node:
             log_store=LogStore(),
             commit_index=0,
             last_applied=0,
-            voted_for=None,
-            last_heartbeat_tick=0
+            voted_for=None
         )
+        self.state_machine = StateMachine()
         self.all_node_ids = all_node_ids
 
     def reconcile_term(self, term: int) -> bool:
@@ -176,6 +190,17 @@ class Node:
         # Allow list
         self.state.voted_for = request.candidate_id
         return VoteResponse(term=self.state.current_term, granted=True)
+    
+
+
+    def apply_committed(self):
+        # Apply in a loop 
+        while self.state.last_applied < self.state.commit_index:
+            self.state.last_applied += 1
+            entry_to_apply = self.state.log_store.get(self.state.last_applied)
+            # Apply to state machine 
+            self.state_machine.set_data(entry_to_apply.command)
+            LOG.info(f"Node {self.id} applied entry {entry_to_apply} to state machine. Current state: {self.state_machine.data}")
             
 
     # TODO: Commit to be added 
@@ -229,6 +254,9 @@ class Node:
         if self.state.log_store.has_index(request.entry.index):
             # Idempotency check 
             if self.state.log_store.term_at(request.entry.index) == request.entry.term:
+                # Apply state 
+                self.state.commit_index = min(request.leader_commit_index, self.state.log_store.last_index())
+                self.apply_committed()
                 return AppendEntryResponse(term=self.state.current_term, success=True, match_index=self.state.log_store.last_index())
             else:
                 # This means a true conflict, need to truncate to pave way 
@@ -238,10 +266,15 @@ class Node:
                 self.state.log_store.truncate_from(request.entry.index)
                 # Now append 
                 self.state.log_store.append_entry(request.entry)
+                # Apply state 
+                self.state.commit_index = min(request.leader_commit_index, self.state.log_store.last_index())
+                self.apply_committed()
                 return AppendEntryResponse(term=request.term, success=True, match_index=self.state.log_store.last_index())
             
         # If we come here, there is nothing conflicting to stop appending of entry 
         self.state.log_store.append_entry(request.entry)
+        self.state.commit_index = min(request.leader_commit_index, self.state.log_store.last_index())
+        self.apply_committed()
         return AppendEntryResponse(term=request.term, success=True, match_index=self.state.log_store.last_index())
 
         
@@ -266,7 +299,10 @@ class RaftClusterSim:
         self.leader: Node = None
         # For simulator purposes only 
         self.cur_leader_index = -1
-        self.majority = len(self.nodes // 2) + 1
+
+    @property
+    def majority(self):
+        return (len(self.nodes) // 2) + 1
 
     def add_node(self, node: Node):
         self.nodes.append(node)
@@ -280,16 +316,15 @@ class RaftClusterSim:
         # Start election in the node 
         candidate_id = candidate_node.start_election()
         # Now send the vote request to other 
-        total_votes = 1
+        total_votes = 0
         for n in self.nodes:
             vote_response = self.send_vote_request(
                 to_node=n,
                 request=VoteRequest(
                     term=candidate_node.state.current_term,
                     candidate_id=candidate_id,
-                    # TBA 
-                    last_log_index=candidate_node.state.last_log_index,
-                    last_log_term=candidate_node.state.last_log_term
+                    last_log_index=candidate_node.state.log_store.last_index(),
+                    last_log_term=candidate_node.state.log_store.last_term()
                 )
             )
             total_votes += 1 if vote_response.granted else 0
@@ -297,6 +332,8 @@ class RaftClusterSim:
         if total_votes >= self.majority:
             # Make the candidate the leader 
             candidate_node.become_leader()
+            # Set cluster leader 
+            self.leader = self.nodes[self.cur_leader_index]
 
         
 
@@ -315,7 +352,7 @@ class RaftClusterSim:
         prev_term = self.leader.state.log_store.term_at(prev_index)
         self.leader.state.log_store.append_entry(entry)
         # Propose to other nodes 
-        total_ack = 1 # Leader counts 1
+        total_ack = 1 # Leader counts 1 since in the loop leader is skipped
         for n in self.nodes:
             if n.id != self.leader.id:
                 ack = n.on_append_entry(
@@ -348,9 +385,6 @@ class RaftClusterSim:
                         )
                     )
 
-    def update_state(self):
-        pass 
-
-    def get_state(self):
-        pass 
+        # Leader apply
+        self.leader.apply_committed() 
 
