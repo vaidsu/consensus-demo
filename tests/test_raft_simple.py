@@ -17,7 +17,7 @@ from raft_simple import (
     VoteRequest,
 )
 
-
+# Most of the tests are kept simple based on just 3 node structure 
 def make_node(node_id: int, all_ids=None):
     if all_ids is None:
         all_ids = [1, 2, 3]
@@ -34,7 +34,8 @@ def test_logstore_term_at_sentinel():
     store = LogStore()
     assert store.term_at(0) == 0
 
-
+### Log store tests
+# Test if log store updates the key indices correctly. 
 def test_logstore_append_and_truncate():
     store = LogStore()
     store.append_entry(LogEntry(index=1, term=1, command="SET a 1"))
@@ -48,6 +49,15 @@ def test_logstore_append_and_truncate():
     assert store.last_term() == 1
 
 
+def test_logstore_rejects_index_gaps():
+    store = LogStore()
+    store.append_entry(LogEntry(index=1, term=1, command="SET a 1"))
+    with pytest.raises(AssertionError):
+        store.append_entry(LogEntry(index=3, term=1, command="SET b 2"))
+
+
+### Voting tests 
+# Term recon for votes 
 def test_vote_rejects_lower_term():
     node = make_node(1)
     node.state.current_term = 2
@@ -56,7 +66,7 @@ def test_vote_rejects_lower_term():
     assert resp.granted is False
     assert node.state.current_term == 2
 
-
+# Ensure that candidate becomes follower on term logic 
 def test_vote_grants_higher_term_and_steps_down():
     node = make_node(1)
     node.state.role = NodeRole.CANDIDATE
@@ -77,6 +87,7 @@ def test_vote_one_per_term():
     resp1 = node.on_vote_request(req1)
     resp2 = node.on_vote_request(req2)
     assert resp1.granted is True
+    # This is not granted because there is already a vote for ID 2 for the same term 
     assert resp2.granted is False
 
 
@@ -86,11 +97,16 @@ def test_vote_log_freshness():
     stale = VoteRequest(term=2, candidate_id=2, last_log_index=1, last_log_term=1)
     fresh = VoteRequest(term=2, candidate_id=2, last_log_index=1, last_log_term=2)
     assert node.on_vote_request(stale).granted is False
+    # Node: [(1, 2, "SET a 1")]
+    # Request: last_index=1, last_term=1 -> This is stale because term is already 2 
+    # Fresh one: Term = 2 and last_log_term=2, this matches term == entry, but last_log_index >= entry.index
     assert node.on_vote_request(fresh).granted is True
 
 
+## Append entry rejects tests 
 def test_append_entry_rejects_missing_prev_index():
     node = make_node(1)
+    # No entry exist, and this will fail 
     req = AppendEntryRequest(
         term=1,
         leader_id=2,
@@ -137,6 +153,7 @@ def test_append_entry_conflict_truncates_and_appends():
     assert node.state.log_store.term_at(2) == 3
 
 
+## Sim level tests 
 def test_cluster_election_selects_leader():
     cluster = RaftClusterSim()
     nodes = [make_node(1), make_node(2), make_node(3)]
@@ -146,6 +163,43 @@ def test_cluster_election_selects_leader():
     assert cluster.leader is not None
     assert cluster.leader.state.role == NodeRole.LEADER
 
+# Ensure that append entry deoesn't mean that we have actually committed it until it happens 
+def test_follower_appends_but_does_not_apply_until_committed():
+    node = make_node(1)
+
+    # Start from clean log with sentinel prev_index=0
+    req_append_uncommitted = AppendEntryRequest(
+        term=1,
+        leader_id=2,
+        prev_index=0,
+        prev_term=0,
+        entry=LogEntry(index=1, term=1, command="SET sensor1 32"),
+        leader_commit_index=0,  # NOT committed yet
+    )
+    resp = node.on_append_entry(req_append_uncommitted)
+    assert resp.success is True
+
+    # Entry replicated, but not committed/applied
+    assert node.state.log_store.last_index() == 1
+    assert node.state.commit_index == 0
+    assert node.state.last_applied == 0
+    assert "sensor1" not in node.state_machine.data  # or == {} if you prefer
+
+    # Now leader commits and tells follower (can resend same entry idempotently)
+    req_commit = AppendEntryRequest(
+        term=1,
+        leader_id=2,
+        prev_index=0,
+        prev_term=0,
+        entry=LogEntry(index=1, term=1, command="SET sensor1 32"),
+        leader_commit_index=1,
+    )
+    resp2 = node.on_append_entry(req_commit)
+    assert resp2.success is True
+
+    assert node.state.commit_index == 1
+    assert node.state.last_applied == 1
+    assert node.state_machine.data["sensor1"] == 32
 
 def test_cluster_propose_commits_majority():
     cluster = RaftClusterSim()
@@ -154,9 +208,15 @@ def test_cluster_propose_commits_majority():
         cluster.add_node(n)
     cluster.start_election()
 
-    entry = LogEntry(index=1, term=cluster.leader.state.current_term, command="SET a 10")
+    entry = LogEntry(index=1, term=cluster.leader.state.current_term, command="SET sensor1 32")
     cluster.propose(entry)
 
+    # Leader committed
     assert cluster.leader.state.commit_index == 1
+
+    # Everyone replicated + committed + applied
     for n in nodes:
         assert n.state.log_store.last_index() == 1
+        assert n.state.commit_index == 1
+        assert n.state.last_applied == 1
+        assert n.state_machine.data["sensor1"] == 32

@@ -46,6 +46,7 @@ class LogStore:
 
     def append_entry(self, entry: LogEntry) -> None:
         # It is an append only entry, it doesn't care about the exact requirement. 
+        assert entry.index == self.last_index() + 1, "Log entries must be contiguous"
         self.logs.append(entry)
     
     def truncate_from(self, index: int):
@@ -156,8 +157,6 @@ class Node:
         return True
         
     def is_log_up_to_date(self, requested_last_term: int, requested_last_index: int) -> bool:
-        # candidate_last_term > my_last_term, OR
-        # candidate_last_term == my_last_term AND candidate_last_index >= my_last_index
         
         last_log_term = self.state.log_store.last_term()
         last_log_index = self.state.log_store.last_index()
@@ -238,16 +237,19 @@ class Node:
         # Deny list first 
         # Term reconcilliation 
         if not self.reconcile_term(request.term):
+            LOG.error(f"Recon term failed {request.term} {request.entry} {self.state}")
             return AppendEntryResponse(term=request.term, success=False, match_index=None)
         
         # Check the last_index and last_term first 
         cur_node_log_term = self.state.log_store.term_at(request.prev_index)
         if request.prev_index > self.state.log_store.last_index():
             # Entries missing 
+            LOG.error(f"Current node misses entries failed {request.term} {request.entry}  {self.state}")
             return AppendEntryResponse(term=request.term, success=False, match_index=None)
         # index match, so we check if terms match 
         elif request.prev_index > 0 and cur_node_log_term != request.prev_term:
             # Stale term coming in 
+            LOG.error(f"Incorrect term {request.term} {self.state} {request.entry}")
             return AppendEntryResponse(term=request.term, success=False, match_index=None)
         
         # Ready to append, need to merge conflict checks 
@@ -257,6 +259,7 @@ class Node:
                 # Apply state 
                 self.state.commit_index = min(request.leader_commit_index, self.state.log_store.last_index())
                 self.apply_committed()
+                LOG.info(f"Idempotent request {request.term} {self.state} {request.entry}")
                 return AppendEntryResponse(term=self.state.current_term, success=True, match_index=self.state.log_store.last_index())
             else:
                 # This means a true conflict, need to truncate to pave way 
@@ -275,6 +278,7 @@ class Node:
         self.state.log_store.append_entry(request.entry)
         self.state.commit_index = min(request.leader_commit_index, self.state.log_store.last_index())
         self.apply_committed()
+        LOG.info(f"Happy path request {request.term} {self.state} {request.entry}")
         return AppendEntryResponse(term=request.term, success=True, match_index=self.state.log_store.last_index())
 
         
@@ -292,6 +296,12 @@ class Node:
         self.state.voted_for = self.id
 
 
+"""
+The simulator is very simple to pretty much orchestrate things to emulate the basics of RAFT. 
+Most of the behaviors are encapsulated into the Node and this is simply to help orchestrate
+All the nodes implements a handler for handling append_entry and vote_request, this way its like the node
+gets the request and processes and it makes testing easier
+"""
 class RaftClusterSim:
 
     def __init__(self) -> None:
@@ -387,4 +397,3 @@ class RaftClusterSim:
 
         # Leader apply
         self.leader.apply_committed() 
-
