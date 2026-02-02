@@ -5,7 +5,7 @@ Every part of the implementation is in one file - Before any expansion
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Set
 import logging
 from collections import defaultdict
 
@@ -309,6 +309,8 @@ class RaftClusterSim:
         self.leader: Node = None
         # For simulator purposes only 
         self.cur_leader_index = -1
+        # To emulate the toy version of offline bluetooth mode - Ref: https://www.eightsleep.com/blog/backup-mode 
+        self.offline_node_ids: Set[int] = set()
 
     @property
     def majority(self):
@@ -328,16 +330,20 @@ class RaftClusterSim:
         # Now send the vote request to other 
         total_votes = 0
         for n in self.nodes:
-            vote_response = self.send_vote_request(
-                to_node=n,
-                request=VoteRequest(
-                    term=candidate_node.state.current_term,
-                    candidate_id=candidate_id,
-                    last_log_index=candidate_node.state.log_store.last_index(),
-                    last_log_term=candidate_node.state.log_store.last_term()
+            # Emulate a concept when a node is offline 
+            # This check is to force the simulator not send anything to those nodes (as if the node didn't get it. )
+            # Then the node will sync eventually to commit
+            if n.id not in self.offline_node_ids:
+                vote_response = self.send_vote_request(
+                    to_node=n,
+                    request=VoteRequest(
+                        term=candidate_node.state.current_term,
+                        candidate_id=candidate_id,
+                        last_log_index=candidate_node.state.log_store.last_index(),
+                        last_log_term=candidate_node.state.log_store.last_term()
+                    )
                 )
-            )
-            total_votes += 1 if vote_response.granted else 0
+                total_votes += 1 if vote_response.granted else 0
         
         if total_votes >= self.majority:
             # Make the candidate the leader 
@@ -364,7 +370,7 @@ class RaftClusterSim:
         # Propose to other nodes 
         total_ack = 1 # Leader counts 1 since in the loop leader is skipped
         for n in self.nodes:
-            if n.id != self.leader.id:
+            if n.id != self.leader.id and n.id not in self.offline_node_ids:
                 ack = n.on_append_entry(
                     request=AppendEntryRequest(
                         term=self.leader.state.current_term,
@@ -383,7 +389,7 @@ class RaftClusterSim:
 
             # Broadcast the commit 
             for n in self.nodes:
-                if n.id != self.leader.id:
+                if n.id != self.leader.id and n.id not in self.offline_node_ids:
                     n.on_append_entry(
                         AppendEntryRequest(
                             term=self.leader.state.current_term,
@@ -397,3 +403,40 @@ class RaftClusterSim:
 
         # Leader apply
         self.leader.apply_committed() 
+
+    def sync_offline_node(self, node_id: int):
+        # This is to simulate, when the offline node comes up again, we sync the node. 
+        # Sync has to happen from the node's (follower) last_index before they went offline until the leader's last_index 
+        # For each index we append entry 
+        # Once append entry is complete, and we apply_commit to that node 
+        # This will simulate when nodes go offline (during outage) and once its back it sync'd the current state 
+        # Inspired by how Eight sleep got the offline mode ready 
+        # Adapted to this consensus for fun 
+        follower_node = [n for n in self.nodes if n.id == node_id][0] # Assume node definitely exist
+        if node_id not in self.offline_node_ids:
+            LOG.error(f"Not an offline node wrong simulation {node_id}")
+            return
+        next_index = follower_node.state.log_store.last_index() + 1
+        leader_last_index = self.leader.state.log_store.last_index()
+        # We need to walk from next_index to leader_last_index and append_entry 
+        while next_index <= leader_last_index:
+            prev_index = next_index - 1
+            prev_term = self.leader.state.log_store.term_at(prev_index)
+            entry = self.leader.state.log_store.get(next_index)
+            LOG.info(f"Syncing node {node_id} with entry {entry}")
+            follower_node.on_append_entry(
+                AppendEntryRequest(
+                    term=self.leader.state.current_term,
+                    leader_id=self.leader.id,
+                    prev_index=prev_index,
+                    prev_term=prev_term,
+                    entry=entry,
+                    leader_commit_index=self.leader.state.commit_index
+                )
+            )
+            next_index += 1
+        # Once all the entries are appended to the follower by leader we apply 
+        follower_node.apply_committed()
+
+        # For sanity remove from offline list
+        self.offline_node_ids.remove(node_id)

@@ -38,9 +38,9 @@ def test_logstore_term_at_sentinel():
 # Test if log store updates the key indices correctly. 
 def test_logstore_append_and_truncate():
     store = LogStore()
-    store.append_entry(LogEntry(index=1, term=1, command="SET a 1"))
-    store.append_entry(LogEntry(index=2, term=1, command="SET b 2"))
-    store.append_entry(LogEntry(index=3, term=2, command="SET c 3"))
+    store.append_entry(LogEntry(index=1, term=1, command="SET sensor1 1"))
+    store.append_entry(LogEntry(index=2, term=1, command="SET sensor2 2"))
+    store.append_entry(LogEntry(index=3, term=2, command="SET sensor3 3"))
     assert store.last_index() == 3
     assert store.last_term() == 2
 
@@ -51,9 +51,9 @@ def test_logstore_append_and_truncate():
 
 def test_logstore_rejects_index_gaps():
     store = LogStore()
-    store.append_entry(LogEntry(index=1, term=1, command="SET a 1"))
+    store.append_entry(LogEntry(index=1, term=1, command="SET sensor1 1"))
     with pytest.raises(AssertionError):
-        store.append_entry(LogEntry(index=3, term=1, command="SET b 2"))
+        store.append_entry(LogEntry(index=3, term=1, command="SET sensor2 2"))
 
 
 ### Voting tests 
@@ -93,11 +93,11 @@ def test_vote_one_per_term():
 
 def test_vote_log_freshness():
     node = make_node(1)
-    node.state.log_store.append_entry(LogEntry(index=1, term=2, command="SET a 1"))
+    node.state.log_store.append_entry(LogEntry(index=1, term=2, command="SET sensor1 1"))
     stale = VoteRequest(term=2, candidate_id=2, last_log_index=1, last_log_term=1)
     fresh = VoteRequest(term=2, candidate_id=2, last_log_index=1, last_log_term=2)
     assert node.on_vote_request(stale).granted is False
-    # Node: [(1, 2, "SET a 1")]
+    # Node: [(1, 2, "SET sensor1 1")]
     # Request: last_index=1, last_term=1 -> This is stale because term is already 2 
     # Fresh one: Term = 2 and last_log_term=2, this matches term == entry, but last_log_index >= entry.index
     assert node.on_vote_request(fresh).granted is True
@@ -112,7 +112,7 @@ def test_append_entry_rejects_missing_prev_index():
         leader_id=2,
         prev_index=1,
         prev_term=1,
-        entry=LogEntry(index=2, term=1, command="SET a 1"),
+        entry=LogEntry(index=2, term=1, command="SET sensor1 1"),
         leader_commit_index=0,
     )
     resp = node.on_append_entry(req)
@@ -121,13 +121,13 @@ def test_append_entry_rejects_missing_prev_index():
 
 def test_append_entry_rejects_prev_term_mismatch():
     node = make_node(1)
-    node.state.log_store.append_entry(LogEntry(index=1, term=1, command="SET a 1"))
+    node.state.log_store.append_entry(LogEntry(index=1, term=1, command="SET sensor1 1"))
     req = AppendEntryRequest(
         term=2,
         leader_id=2,
         prev_index=1,
         prev_term=2,
-        entry=LogEntry(index=2, term=2, command="SET b 2"),
+        entry=LogEntry(index=2, term=2, command="SET sensor2 2"),
         leader_commit_index=0,
     )
     resp = node.on_append_entry(req)
@@ -136,15 +136,15 @@ def test_append_entry_rejects_prev_term_mismatch():
 
 def test_append_entry_conflict_truncates_and_appends():
     node = make_node(1)
-    node.state.log_store.append_entry(LogEntry(index=1, term=1, command="SET a 1"))
-    node.state.log_store.append_entry(LogEntry(index=2, term=2, command="SET b 2"))
+    node.state.log_store.append_entry(LogEntry(index=1, term=1, command="SET sensor1 1"))
+    node.state.log_store.append_entry(LogEntry(index=2, term=2, command="SET sensor2 2"))
 
     req = AppendEntryRequest(
         term=3,
         leader_id=2,
         prev_index=1,
         prev_term=1,
-        entry=LogEntry(index=2, term=3, command="SET c 3"),
+        entry=LogEntry(index=2, term=3, command="SET sensor3 3"),
         leader_commit_index=2,
     )
     resp = node.on_append_entry(req)
@@ -220,3 +220,30 @@ def test_cluster_propose_commits_majority():
         assert n.state.commit_index == 1
         assert n.state.last_applied == 1
         assert n.state_machine.data["sensor1"] == 32
+
+
+def test_offline_node_syncs_after_rejoin():
+    cluster = RaftClusterSim()
+    nodes = [make_node(1), make_node(2), make_node(3)]
+    for n in nodes:
+        cluster.add_node(n)
+    cluster.start_election()
+
+    offline_node = nodes[1]
+    cluster.offline_node_ids.add(offline_node.id)
+
+    entry1 = LogEntry(index=1, term=cluster.leader.state.current_term, command="SET sensor1 32")
+    entry2 = LogEntry(index=2, term=cluster.leader.state.current_term, command="SET sensor2 20")
+    cluster.propose(entry1)
+    cluster.propose(entry2)
+
+    assert offline_node.state.log_store.last_index() == 0
+    assert offline_node.state.commit_index == 0
+    assert "sensor1" not in offline_node.state_machine.data
+
+    cluster.sync_offline_node(offline_node.id)
+
+    assert offline_node.state.log_store.last_index() == 2
+    assert offline_node.state.commit_index == cluster.leader.state.commit_index
+    assert offline_node.state_machine.data["sensor1"] == 32
+    assert offline_node.state_machine.data["sensor2"] == 20
